@@ -2,8 +2,8 @@
 """
 Wilson — a push-button Raspberry Pi home assistant.
 
-Buttons: weather / dad joke / mp3 / affirmation.
-Double-press any button: open the NASA ISS live stream fullscreen.
+Buttons: weather / dad joke / mp3 / affirmation / recipe / stream.
+The stream button (GPIO20) opens the NASA ISS live stream fullscreen.
 Display: a fullscreen animated face on HDMI (pygame).
 On boot: an actuator presses the TV's power button on; 5 min later, off.
 
@@ -16,10 +16,9 @@ core design choice that keeps the code simple and prevents Wilson from
 time, two button presses can't both be speaking at once. A new action
 signals the current one to stop (via a threading.Event), then runs.
 
-GPIO callbacks therefore do almost nothing: they debounce, decide
-single-vs-double press, and hand an Action to the controller. They never
-block and never speak directly — RPi.GPIO callbacks must return promptly
-or the library starts dropping button edges.
+GPIO callbacks therefore do almost nothing: they debounce and hand an
+Action to the controller. They never block and never speak directly —
+RPi.GPIO callbacks must return promptly or the library drops button edges.
 
 The main thread does only two things: render the face at 30fps, and
 watch for quit. All shared state lives in the Controller behind one lock.
@@ -29,11 +28,15 @@ import os
 import sys
 import time
 import json
+import re
 import queue
 import random
 import threading
 import subprocess
+import unicodedata
 import urllib.request
+import urllib.error
+import urllib.parse
 
 import api_keys
 import pygame
@@ -51,6 +54,11 @@ except ImportError:
 PIN_WEATHER, PIN_JOKE, PIN_MUSIC, PIN_AFFIRMATION = 17, 27, 22, 23
 BUTTON_PINS = (PIN_WEATHER, PIN_JOKE, PIN_MUSIC, PIN_AFFIRMATION)
 
+# Recipe and stream buttons each have their own dedicated edge callback,
+# so they stay out of the (now removed) double-press machinery.
+PIN_RECIPE = 21   # momentary button: GPIO21 (phys pin 40) ── button ── GND → print a recipe
+PIN_STREAM = 20   # momentary button: GPIO20 (phys pin 38) ── button ── GND → open NASA feed
+
 PIN_ACTUATOR_EXTEND, PIN_ACTUATOR_RETRACT = 24, 25
 ACTUATOR_EXTEND_SECONDS  = 0.7
 ACTUATOR_RETRACT_SECONDS = 1.5
@@ -62,8 +70,24 @@ WEATHER_LON    = "-77.0369"
 API_NINJAS_KEY = api_keys.NINJAS_KEY
 ESPEAK_SPEED   = 145
 
-DOUBLE_PRESS_WINDOW   = 0.5    # max gap between taps to count as a double-press
+SPOONACULAR_KEY = api_keys.SPOONACULAR_KEY
+RECIPE_MAX_READY_MINUTES = 30
+
+# The only words Wilson speaks for a recipe — one picked at random on a
+# successful print. Nothing else in the recipe flow speaks (errors log only).
+RECIPE_SIGNOFFS = ["This looks good", "Bon Appetit", "Bon Provecho", "Enjoy!"]
+
+# USB thermal printer (ESC/POS). Find YOUR values with `lsusb` — the line
+# for the printer looks like:  ID 0416:5011 Winbond ...  → 0x0416, 0x5011.
+# These are common POS-58 defaults but almost certainly need changing.
+PRINTER_VENDOR_ID  = 0x0416
+PRINTER_PRODUCT_ID = 0x5011
+
 HARD_DEBOUNCE_SECONDS = 0.25   # software debounce (RPi.GPIO's is unreliable on Pi 5)
+# The recipe/stream buttons use a wider debounce: a single deliberate press
+# should never yield two actions, and you'd never want two within a second.
+# This is what kills the "two recipes per press" double-fire.
+DEDICATED_DEBOUNCE_SECONDS = 1.0
 IDLE_TO_STREAM_SECONDS = 20    # after this long idle, auto-open the NASA stream
 
 YOUTUBE_VIDEO_ID  = "uwXgcTc8oY8"
@@ -103,6 +127,7 @@ FACES = {
     "boot": ["(⇀‿‿↼)", "(⇀‿‿↼)", "(≖‿‿≖)", "(≖‿‿≖)", "(◕‿‿◕)", "(◕‿‿◕)"],
     "idle": ["(⚆⚆ )", "(☉☉ )"],
     "loading": ["(☼‿‿☼)"],
+    "recipe": ["( ◕‿◕)"],   
     "talk": ["(⇀‿o‿↼)", "(⇀‿O‿↼)", "(⇀‿O‿↼)", "(⇀‿o‿↼)"],
     "weather": ["(⇀☐‿☐↼)", "(⇀☐o☐↼)", "(⇀☐O☐↼)", "(⇀☐o☐↼)"],
     "joke": ["(⇀^o^↼)", "(⇀^O^↼)", "(⇀^o^↼)"],
@@ -192,6 +217,80 @@ def fetch_json(url, headers=None):
     req = urllib.request.Request(url, headers=headers or {})
     with urllib.request.urlopen(req, timeout=8) as r:
         return json.loads(r.read().decode())
+
+# Unicode "vulgar fraction" characters → decimal value. Spoonacular ingredient
+# strings use these (e.g. "½ cup"), and the thermal printer can't render them,
+# so we substitute readable decimals before printing.
+_UNICODE_FRACTIONS = {
+    "½": 0.5,  "⅓": 1/3, "⅔": 2/3, "¼": 0.25, "¾": 0.75,
+    "⅕": 0.2,  "⅖": 0.4, "⅗": 0.6, "⅘": 0.8,
+    "⅙": 1/6,  "⅚": 5/6, "⅛": 0.125, "⅜": 0.375, "⅝": 0.625, "⅞": 0.875,
+    "⅐": 1/7,  "⅑": 1/9, "⅒": 0.1,
+}
+
+def _fmt_decimal(x):
+    # 3 decimals so eighths are exact (0.125); trailing zeros stripped so
+    # halves/quarters stay clean (0.5, 0.25). Thirds become 0.333 / 0.667.
+    return f"{x:.3f}".rstrip("0").rstrip(".")
+
+def to_printable(text):
+    """Make a string printable on the ASCII-only thermal printer.
+
+    1. Fractions: "1½" / "1 ½" → "1.5"; a bare "½" → "0.5", "¼" → "0.25", etc.
+    2. Common typographic chars (smart quotes, dashes) → ASCII equivalents.
+    3. Remaining accented letters folded to ASCII (é→e, ñ→n, jalapeño→jalapeno).
+    4. Anything still non-ASCII is dropped rather than printed as "?"."""
+    frac_class = "".join(re.escape(c) for c in _UNICODE_FRACTIONS)
+
+    # Mixed number: an integer immediately followed by a fraction → add them.
+    def _mixed(m):
+        return _fmt_decimal(int(m.group(1)) + _UNICODE_FRACTIONS[m.group(2)])
+    text = re.sub(rf"(\d+)\s*([{frac_class}])", _mixed, text)
+
+    # Any remaining standalone fractions.
+    for ch, val in _UNICODE_FRACTIONS.items():
+        text = text.replace(ch, _fmt_decimal(val))
+
+    # Typographic punctuation the printer would otherwise drop.
+    text = (text.replace("\u2018", "'").replace("\u2019", "'")
+                .replace("\u201c", '"').replace("\u201d", '"')
+                .replace("\u2013", "-").replace("\u2014", "-"))
+
+    # Fold accents (é→e), then drop anything left that isn't ASCII.
+    text = unicodedata.normalize("NFKD", text)
+    return text.encode("ascii", "ignore").decode("ascii")
+
+_PRINTER_LOCK = threading.Lock()
+
+def print_recipe(title, ingredients, instructions):
+    ESC = b"\x1b"
+    GS  = b"\x1d"
+    init = ESC + b"@"
+    bold_on  = ESC + b"E" + b"\x01"
+    bold_off = ESC + b"E" + b"\x00"
+    center   = ESC + b"a" + b"\x01"
+    left     = ESC + b"a" + b"\x00"
+    cut      = GS  + b"V" + b"\x00"
+
+    # Leading NUL padding absorbs any dropped first byte on a "cold" USB write
+    # (the fix that cured the stray leading "@" on the Windows side too). NULs
+    # are ignored by ESC/POS, so they're harmless if nothing gets dropped.
+    body  = b"\x00\x00\x00" + init
+    body += center + bold_on
+    body += (to_printable(title) + "\n\n").encode("ascii", errors="replace")
+    body += bold_off + left
+    body += b"Ingredients:\n"
+    for ing in ingredients:
+        body += ("- " + to_printable(ing) + "\n").encode("ascii", errors="replace")
+    body += b"\nInstructions:\n"
+    body += to_printable(instructions).encode("ascii", errors="replace")
+    body += b"\n\n\n\n"
+    body += cut
+
+    # Serialize printer access so two jobs can never interleave at the device.
+    with _PRINTER_LOCK:
+        with open("/dev/usb/lp0", "wb") as f:
+            f.write(body)
 
 def press_tv_power_button():
     """Extend the actuator to push the TV power button, then retract.
@@ -408,6 +507,7 @@ class Controller:
         self._action_ran = False         # set when a real action is submitted;
                                           # read+cleared by the main loop to reset
                                           # the once-per-idle-session auto-open lock
+        self._last_active = time.time()  # last button press; gates idle auto-open
         threading.Thread(target=self._worker_loop, daemon=True).start()
 
     # ---- state accessors (all behind the lock) ----------------------
@@ -436,6 +536,17 @@ class Controller:
     def current_face_set(self):
         with self._lock:
             return self._face_set
+
+    def mark_active(self):
+        """Record a button press. Resets the idle-stream countdown so the
+        NASA auto-open can't fire right as (or just after) a button is
+        pressed — closing the race that let a recipe press pop the stream."""
+        with self._lock:
+            self._last_active = time.time()
+
+    def seconds_since_active(self):
+        with self._lock:
+            return time.time() - self._last_active
 
     # ---- queueing ---------------------------------------------------
 
@@ -580,11 +691,90 @@ def action_boot(c):
         time.sleep(1.0)
     c.speak(random.choice(GREETINGS))
 
+def action_recipe(c):
+    """Fetch a random <=30-min vegetarian main/salad/soup from Spoonacular
+    and print it. Two sequential HTTP calls (search → full details) block
+    the single worker thread for up to ~16s worst case, during which other
+    buttons queue rather than run — the static recipe face shows meanwhile."""
+    c.set_face("recipe", caption="")   # static ( ◕‿◕) held through finding + printing
+
+    # ---- step 1: search ----
+    try:
+        query = urllib.parse.urlencode({
+            "apiKey": SPOONACULAR_KEY,
+            "diet": "vegetarian",
+            "type": "main course,salad,soup",
+            "maxReadyTime": RECIPE_MAX_READY_MINUTES,
+            "sort": "random",
+            "number": 1,
+        })
+        search_url = f"https://api.spoonacular.com/recipes/complexSearch?{query}"
+        print(f"[recipe] search URL: {search_url.replace(SPOONACULAR_KEY, 'REDACTED')}", flush=True)
+
+        req = urllib.request.Request(search_url, headers={"User-Agent": "Wilson/1.0"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            raw = r.read().decode()
+        print(f"[recipe] search response: {raw[:300]}", flush=True)
+        search = json.loads(raw)
+
+    except urllib.error.HTTPError as e:
+        body = e.read().decode()[:400]
+        print(f"[recipe] search HTTP {e.code}: {body}", flush=True)
+        return
+    except Exception as e:
+        print(f"[recipe] search exception: {e!r}", flush=True)
+        return
+
+    results = search.get("results") or []
+    if not results:
+        print("[recipe] no results returned", flush=True)
+        return
+
+    recipe_id = results[0]["id"]
+    print(f"[recipe] got recipe id: {recipe_id}", flush=True)
+
+    # ---- step 2: full details ----
+    try:
+        info_url = (f"https://api.spoonacular.com/recipes/{recipe_id}/information"
+                    f"?apiKey={SPOONACULAR_KEY}")
+        print(f"[recipe] info URL: {info_url.replace(SPOONACULAR_KEY, 'REDACTED')}", flush=True)
+
+        req2 = urllib.request.Request(info_url, headers={"User-Agent": "Wilson/1.0"})
+        with urllib.request.urlopen(req2, timeout=10) as r:
+            raw2 = r.read().decode()
+        print(f"[recipe] info response (first 200): {raw2[:200]}", flush=True)
+        info = json.loads(raw2)
+
+    except urllib.error.HTTPError as e:
+        body = e.read().decode()[:400]
+        print(f"[recipe] info HTTP {e.code}: {body}", flush=True)
+        return
+    except Exception as e:
+        print(f"[recipe] info exception: {e!r}", flush=True)
+        return
+
+    title = info.get("title", "Untitled recipe")
+    ingredients = [ing["original"] for ing in info.get("extendedIngredients", [])]
+    raw_instr = info.get("instructions") or "No instructions provided."
+    instructions = re.sub("<[^<]+?>", "", raw_instr)[:1000]
+
+    # ---- step 3: print ----
+    try:
+        print_recipe(title, ingredients, instructions)
+        print(f"[recipe] printed: {title}", flush=True)
+    except Exception as e:
+        print(f"[recipe] print exception: {e!r}", flush=True)
+        return
+
+    # The only spoken words in the whole recipe flow: one random sign-off.
+    c.speak(random.choice(RECIPE_SIGNOFFS))
+
 ACTIONS = {
     "weather": action_weather,
     "joke": action_joke,
     "affirmation": action_affirmation,
     "music": action_music,
+    "recipe": action_recipe,
     "boot": action_boot,
 }
 
@@ -596,14 +786,13 @@ PIN_TO_ACTION = {
 }
 
 # ════════════════════════════════════════════════════════════════════
-# BUTTON INPUT  — debounce + single/double-press, then hand to controller
+# BUTTON INPUT  — debounce a single press, then hand an action to the controller
 # ════════════════════════════════════════════════════════════════════
 
 class Buttons:
     def __init__(self, controller):
         self.c = controller
         self._last_edge = {p: 0.0 for p in BUTTON_PINS}
-        self._pending = {p: None for p in BUTTON_PINS}  # threading.Timer per pin
         self._lock = threading.Lock()
 
         GPIO.setmode(GPIO.BCM)
@@ -611,51 +800,72 @@ class Buttons:
             GPIO.setup(p, GPIO.IN, pull_up_down=GPIO.PUD_UP)
             GPIO.add_event_detect(p, GPIO.FALLING, callback=self._on_edge,
                                   bouncetime=120)
+
+        # Recipe button (GPIO21): dedicated handler → print a recipe.
+        self._recipe_last_edge = 0.0
+        GPIO.setup(PIN_RECIPE, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+        GPIO.add_event_detect(PIN_RECIPE, GPIO.FALLING,
+                              callback=self._on_recipe_edge, bouncetime=120)
+
+        # Stream button (GPIO20): dedicated handler → open/close the NASA feed.
+        self._stream_last_edge = 0.0
+        GPIO.setup(PIN_STREAM, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+        GPIO.add_event_detect(PIN_STREAM, GPIO.FALLING,
+                              callback=self._on_stream_edge, bouncetime=120)
+
         GPIO.setup(PIN_ACTUATOR_EXTEND, GPIO.OUT, initial=GPIO.LOW)
         GPIO.setup(PIN_ACTUATOR_RETRACT, GPIO.OUT, initial=GPIO.LOW)
 
     def _on_edge(self, channel):
-        # Software debounce — RPi.GPIO's bouncetime is unreliable on Pi 5,
-        # and a bounce misread as a 2nd press would fake a double-press.
+        # One of the four action buttons. Single press = run that action.
+        # (Double-press-opens-stream is gone; the stream has its own button.)
         now = time.time()
         with self._lock:
             if now - self._last_edge[channel] < HARD_DEBOUNCE_SECONDS:
                 return
             self._last_edge[channel] = now
 
-        # Stream open? Any press just closes it.
+        self.c.mark_active()   # reset idle-stream countdown on any press
+
+        # If the stream is up, a press just closes it (doesn't also run the action).
         if self.c.stream.is_open():
             self.c.stream.close()
             self.c.set_face("idle", caption="")
             return
 
-        with self._lock:
-            pending = self._pending[channel]
-            if pending is not None:
-                # Second press within the window → double-press → stream.
-                pending.cancel()
-                self._pending[channel] = None
-                double = True
-            else:
-                double = False
+        self.c.submit(PIN_TO_ACTION[channel])
 
-        if double:
-            # Stop whatever's running, show the loading face, open stream.
-            self.c.interrupt()
+    def _on_recipe_edge(self, channel):
+        """Recipe button: print a recipe immediately on a single press. Wider
+        debounce than the action buttons so one press never yields two recipes."""
+        now = time.time()
+        with self._lock:
+            if now - self._recipe_last_edge < DEDICATED_DEBOUNCE_SECONDS:
+                return
+            self._recipe_last_edge = now
+
+        self.c.mark_active()
+        if self.c.stream.is_open():
+            self.c.stream.close()
+        self.c.submit("recipe")
+
+    def _on_stream_edge(self, channel):
+        """Stream button (GPIO20): toggle the NASA ISS live feed. Press once to
+        open it fullscreen; press again (or any action button) to close it."""
+        now = time.time()
+        with self._lock:
+            if now - self._stream_last_edge < DEDICATED_DEBOUNCE_SECONDS:
+                return
+            self._stream_last_edge = now
+
+        self.c.mark_active()
+        if self.c.stream.is_open():
+            self.c.stream.close()
+            self.c.set_face("idle", caption="")
+        else:
+            self.c.interrupt()                       # stop any running action
             self.c.set_face("loading", caption="")
             self.c.stream.open()
-            return
-
-        # First press: wait DOUBLE_PRESS_WINDOW to see if a second follows.
-        t = threading.Timer(DOUBLE_PRESS_WINDOW, self._fire_single, args=(channel,))
-        with self._lock:
-            self._pending[channel] = t
-        t.start()
-
-    def _fire_single(self, channel):
-        with self._lock:
-            self._pending[channel] = None
-        self.c.submit(PIN_TO_ACTION[channel])
 
 # ════════════════════════════════════════════════════════════════════
 # MAIN
@@ -722,7 +932,8 @@ def main():
                 if idle_since is None:
                     idle_since = time.time()
                 elif (not auto_opened
-                        and time.time() - idle_since >= IDLE_TO_STREAM_SECONDS):
+                        and time.time() - idle_since >= IDLE_TO_STREAM_SECONDS
+                        and controller.seconds_since_active() >= IDLE_TO_STREAM_SECONDS):
                     controller.set_face("loading", caption="")
                     controller.stream.open()
                     auto_opened = True
