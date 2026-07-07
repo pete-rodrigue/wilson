@@ -39,6 +39,7 @@ import urllib.error
 import urllib.parse
 
 import api_keys
+import polars as pl
 import pygame
 import RPi.GPIO as GPIO
 
@@ -62,16 +63,23 @@ PIN_STREAM = 20   # momentary button: GPIO20 (phys pin 38) ── button ── 
 PIN_ACTUATOR_EXTEND, PIN_ACTUATOR_RETRACT = 24, 25
 ACTUATOR_EXTEND_SECONDS  = 0.7
 ACTUATOR_RETRACT_SECONDS = 1.5
-TV_AUTO_OFF_SECONDS      = 5 * 60
+TV_AUTO_OFF_SECONDS      = 10 * 60
 
 MP3_FILE       = "/home/admin/Desktop/wilson/forest_track.mp3"
 WEATHER_LAT    = "38.9072"
 WEATHER_LON    = "-77.0369"
-API_NINJAS_KEY = api_keys.NINJAS_KEY
 ESPEAK_SPEED   = 145
 
-SPOONACULAR_KEY = api_keys.SPOONACULAR_KEY
-RECIPE_MAX_READY_MINUTES = 30
+# Jokes via Humor API (https://humorapi.com/docs/). Add HUMOR_API_KEY to
+# api_keys.py. racist/sexist/nsfw jokes excluded via exclude-tags.
+HUMOR_API_KEY      = api_keys.HUMOR_API_KEY
+JOKE_EXCLUDE_TAGS  = "racist,sexist,nsfw"
+
+# Recipes and quotes from local CSVs — work with no network.
+# Paths resolved relative to this file, not the CWD (matters under systemd).
+SCRIPT_DIR  = os.path.dirname(os.path.abspath(__file__))
+RECIPES_CSV = os.path.join(SCRIPT_DIR, "recipes.csv")
+INSPO_CSV   = os.path.join(SCRIPT_DIR, "inspo.csv")
 
 # The only words Wilson speaks for a recipe — one picked at random on a
 # successful print. Nothing else in the recipe flow speaks (errors log only).
@@ -115,6 +123,33 @@ GREETINGS = [
     "Hello, Demon!",
     "What's up freak",
 ]
+
+# ════════════════════════════════════════════════════════════════════
+# LOCAL DATA  — recipes + quotes, loaded once at startup with polars
+# ════════════════════════════════════════════════════════════════════
+
+def _read_csv_bom_safe(path):
+    df = pl.read_csv(path)
+    first = df.columns[0]
+    if first.startswith("\ufeff"):
+        df = df.rename({first: first.lstrip("\ufeff")})
+    return df
+
+try:
+    RECIPES_DF = _read_csv_bom_safe(RECIPES_CSV)
+    print(f"[data] loaded {RECIPES_DF.height} recipes", flush=True)
+except Exception as e:
+    RECIPES_DF = None
+    print(f"[data] FAILED to load recipes: {e!r}", flush=True)
+
+try:
+    _q = _read_csv_bom_safe(INSPO_CSV)
+    QUOTES_LIST = [q for q in _q[_q.columns[0]].to_list() if q and q.strip()]
+    print(f"[data] loaded {len(QUOTES_LIST)} quotes", flush=True)
+except Exception as e:
+    QUOTES_LIST = []
+    print(f"[data] FAILED to load quotes: {e!r}", flush=True)
+
 
 # ════════════════════════════════════════════════════════════════════
 # FACES
@@ -662,20 +697,30 @@ def action_weather(c):
 
 def action_joke(c):
     try:
-        data = fetch_json("https://api.api-ninjas.com/v1/dadjokes",
-                          headers={"X-Api-Key": API_NINJAS_KEY})
-        joke = data[0]["joke"]
+        url = ("https://api.humorapi.com/jokes/random"
+               f"?api-key={HUMOR_API_KEY}"
+               f"&exclude-tags={urllib.parse.quote(JOKE_EXCLUDE_TAGS)}")
+        data = fetch_json(url, headers={"User-Agent": "Wilson/1.0"})
+        joke = (data.get("joke") or "").strip()
+        if not joke:
+            joke = "I had a joke ready, but it came back empty."
     except Exception as e:
         joke = f"I had a joke about UDP, but you might not get it. Also the API failed: {e}"
     c.speak(joke, face_set="joke")
 
+def _clean_quote(q):
+    q = q.strip()
+    if q.startswith('"') and q.endswith('"'):
+        q = q[1:-1].strip()
+    return (q.replace("\u2018", "'").replace("\u2019", "'")
+             .replace("\u201c", "").replace("\u201d", "")
+             .replace("\u2014", ", ").replace("\u2013", "-"))
+
 def action_affirmation(c):
-    try:
-        msg = fetch_json("https://www.affirmations.dev/").get(
-            "affirmation", "You are doing great.")
-    except Exception as e:
-        msg = f"You are amazing. Also the API had trouble: {e}"
-    c.speak(msg, face_set="affirmation")
+    if not QUOTES_LIST:
+        c.speak("Be well.", face_set="affirmation")
+        return
+    c.speak(_clean_quote(random.choice(QUOTES_LIST)), face_set="affirmation")
 
 def action_music(c):
     c.play_music()
@@ -692,81 +737,33 @@ def action_boot(c):
     c.speak(random.choice(GREETINGS))
 
 def action_recipe(c):
-    """Fetch a random <=30-min vegetarian main/salad/soup from Spoonacular
-    and print it. Two sequential HTTP calls (search → full details) block
-    the single worker thread for up to ~16s worst case, during which other
-    buttons queue rather than run — the static recipe face shows meanwhile."""
-    c.set_face("recipe", caption="")   # static ( ◕‿◕) held through finding + printing
+    """Print a random recipe from the local CSV. Works offline."""
+    c.set_face("recipe", caption="")
 
-    # ---- step 1: search ----
+    if RECIPES_DF is None or RECIPES_DF.height == 0:
+        print("[recipe] no recipes loaded — check recipes.csv", flush=True)
+        return
+
     try:
-        query = urllib.parse.urlencode({
-            "apiKey": SPOONACULAR_KEY,
-            "diet": "vegetarian",
-            "type": "main course,salad,soup,breakfast,side dish",
-            "maxReadyTime": RECIPE_MAX_READY_MINUTES,
-            "sort": "random",
-            "number": 1,
-        })
-        search_url = f"https://api.spoonacular.com/recipes/complexSearch?{query}"
-        print(f"[recipe] search URL: {search_url.replace(SPOONACULAR_KEY, 'REDACTED')}", flush=True)
+        row = RECIPES_DF.row(random.randrange(RECIPES_DF.height), named=True)
+        title = (row.get("recipe_title") or "").strip()
+        ingredients = [x.strip() for x in (row.get("ingredients") or "").split("|")
+                       if x.strip()]
+        # Filter punctuation-only fragments (scraped CSV artifact: lone ".")
+        steps = [s.strip() for s in (row.get("instructions") or "").split("|")
+                 if re.search(r"[A-Za-z0-9]", s)]
+        instructions = "\n".join(f"{i}. {s}" for i, s in enumerate(steps, 1))
 
-        req = urllib.request.Request(search_url, headers={"User-Agent": "Wilson/1.0"})
-        with urllib.request.urlopen(req, timeout=10) as r:
-            raw = r.read().decode()
-        print(f"[recipe] search response: {raw[:300]}", flush=True)
-        search = json.loads(raw)
+        if not ingredients and not instructions:
+            print(f"[recipe] empty row skipped: {title[:60]!r}", flush=True)
+            return
 
-    except urllib.error.HTTPError as e:
-        body = e.read().decode()[:400]
-        print(f"[recipe] search HTTP {e.code}: {body}", flush=True)
-        return
-    except Exception as e:
-        print(f"[recipe] search exception: {e!r}", flush=True)
-        return
-
-    results = search.get("results") or []
-    if not results:
-        print("[recipe] no results returned", flush=True)
-        return
-
-    recipe_id = results[0]["id"]
-    print(f"[recipe] got recipe id: {recipe_id}", flush=True)
-
-    # ---- step 2: full details ----
-    try:
-        info_url = (f"https://api.spoonacular.com/recipes/{recipe_id}/information"
-                    f"?apiKey={SPOONACULAR_KEY}")
-        print(f"[recipe] info URL: {info_url.replace(SPOONACULAR_KEY, 'REDACTED')}", flush=True)
-
-        req2 = urllib.request.Request(info_url, headers={"User-Agent": "Wilson/1.0"})
-        with urllib.request.urlopen(req2, timeout=10) as r:
-            raw2 = r.read().decode()
-        print(f"[recipe] info response (first 200): {raw2[:200]}", flush=True)
-        info = json.loads(raw2)
-
-    except urllib.error.HTTPError as e:
-        body = e.read().decode()[:400]
-        print(f"[recipe] info HTTP {e.code}: {body}", flush=True)
-        return
-    except Exception as e:
-        print(f"[recipe] info exception: {e!r}", flush=True)
-        return
-
-    title = info.get("title", "Untitled recipe")
-    ingredients = [ing["original"] for ing in info.get("extendedIngredients", [])]
-    raw_instr = info.get("instructions") or "No instructions provided."
-    instructions = re.sub("<[^<]+?>", "", raw_instr)[:1000]
-
-    # ---- step 3: print ----
-    try:
         print_recipe(title, ingredients, instructions)
-        print(f"[recipe] printed: {title}", flush=True)
+        print(f"[recipe] printed: {title[:60]}", flush=True)
     except Exception as e:
-        print(f"[recipe] print exception: {e!r}", flush=True)
+        print(f"[recipe] error: {e!r}", flush=True)
         return
 
-    # The only spoken words in the whole recipe flow: one random sign-off.
     c.speak(random.choice(RECIPE_SIGNOFFS))
 
 ACTIONS = {
