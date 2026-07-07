@@ -703,7 +703,7 @@ def action_recipe(c):
         query = urllib.parse.urlencode({
             "apiKey": SPOONACULAR_KEY,
             "diet": "vegetarian",
-            "type": "main course,salad,soup",
+            "type": "main course,salad,soup,breakfast,side dish",
             "maxReadyTime": RECIPE_MAX_READY_MINUTES,
             "sort": "random",
             "number": 1,
